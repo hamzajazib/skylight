@@ -242,3 +242,78 @@ describe("sigma-delta dither", () => {
     expect(avg).toBe(0);
   });
 });
+
+describe("byte-0 slow gear", () => {
+  // The real measured low end of the pan table: speed byte 0x00 ≈ 1.47°/s
+  // (the hidden slow gear), byte 1 ≈ 7.9°/s.
+  const LOW_TABLE: [number, number][] = [
+    [0, 1.47],
+    [1, 7.9],
+  ];
+  const rateOf = (step: number) => (step === 0 ? 1.47 : step === 1 ? 7.9 : 0);
+
+  function run(want: number, seconds: number) {
+    const cam = makeCam() as unknown as {
+      pickDithered(
+        st: { onHi: boolean; since: number; acc: number; lastAt: number },
+        table: [number, number][],
+        want: number,
+        now: number,
+      ): number;
+    };
+    const st = { onHi: false, since: 0, acc: 0, lastAt: 0 };
+    const dt = 1000 / 15;
+    const t0 = 1_000_000;
+    let dist = 0;
+    let stops = 0;
+    const n = Math.round((seconds * 1000) / dt);
+    for (let i = 0; i < n; i++) {
+      const step = cam.pickDithered(st, LOW_TABLE, want, t0 + i * dt);
+      if (step < 0) stops++;
+      dist += rateOf(step) * (dt / 1000);
+    }
+    return { avg: dist / seconds, stops };
+  }
+
+  it("plane-band rates dither 0x00<->1 without ever stopping the motor", () => {
+    // 2.5°/s is a typical overhead pass. The old stop<->byte-1 dither parked
+    // the motor ~2/3 of the time (the visible stutter); with the slow gear it
+    // must keep rolling for the whole window.
+    const { avg, stops } = run(2.5, 10);
+    expect(stops).toBe(0);
+    expect(avg).toBeGreaterThan(2.1);
+    expect(avg).toBeLessThan(2.9);
+  });
+
+  it("sub-slow-gear rates duty-cycle against stop and still average true", () => {
+    const { avg, stops } = run(0.8, 10); // below the 1.47 floor
+    expect(stops).toBeGreaterThan(0); // must rest sometimes...
+    expect(avg).toBeGreaterThan(0.6); // ...but deliver the wanted average
+    expect(avg).toBeLessThan(1.0);
+  });
+
+  it("puts byte 0x00 on the wire unclamped, with byte 1 for stopped axes", () => {
+    const cam = makeCam();
+    const sent: number[][] = [];
+    (cam as unknown as { sendCommand(b: number[]): void }).sendCommand = (b) => sent.push(b);
+    setPose(cam, 0, 0);
+    // 1.4°/s is within 7% of the 1.47 slow gear -> held steadily, no dither.
+    cam.trackRate(1.4, 0);
+    expect(sent).toHaveLength(1);
+    const [, , , , vv, ww, panDir, tiltDir] = sent[0];
+    expect(vv).toBe(0x00); // the slow gear, NOT clamped to 1
+    expect(panDir).toBe(0x02); // panning right
+    expect(ww).toBe(1); // stopped tilt axis: canonical byte 1
+    expect(tiltDir).toBe(0x03);
+  });
+
+  it("full stop still sends the canonical stop command", () => {
+    const cam = makeCam();
+    const sent: number[][] = [];
+    (cam as unknown as { sendCommand(b: number[]): void }).sendCommand = (b) => sent.push(b);
+    setPose(cam, 0, 0);
+    cam.trackRate(0, 0);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].slice(4, 8)).toEqual([1, 1, 0x03, 0x03]);
+  });
+});
